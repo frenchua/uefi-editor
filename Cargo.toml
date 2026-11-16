@@ -1,0 +1,3 @@
+[workspace]
+resolver = "3"
+members = ["crates/efivars-core", "crates/efivars-sys", "crates/efivars-tui"]

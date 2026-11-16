@@ -1,0 +1,9 @@
+[package]
+name = "efivars-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+efivars-core = { version = "0.1.0", path = "../efivars-core" }
+efivars-sys = { version = "0.1.0", path = "../efivars-sys" }
+ratatui = "0.30.2"

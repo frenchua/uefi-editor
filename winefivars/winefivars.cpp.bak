@@ -1,0 +1,181 @@
+// winefivars.cpp : This file contains the 'main' function. Program execution begins and ends there.
+//
+
+#include <windows.h>
+#include <winternl.h>
+#include <iostream>
+#include <vector>
+
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+#endif
+
+constexpr NTSTATUS STATUS_BUFFER_TOO_SMALL = static_cast<NTSTATUS>(0xC0000023);
+constexpr NTSTATUS STATUS_INFO_LENGTH_MISMATCH = static_cast<NTSTATUS>(0xC0000004);
+
+bool EnableSystemEnvironmentPrivilege()
+{
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+    {
+        return false;
+    }
+
+    LUID luid{};
+    if (!LookupPrivilegeValueW(nullptr, SE_SYSTEM_ENVIRONMENT_NAME, &luid))
+    {
+        CloseHandle(token);
+        return false;
+    }
+
+    TOKEN_PRIVILEGES privileges{};
+    privileges.PrivilegeCount = 1;
+    privileges.Privileges[0].Luid = luid;
+    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    SetLastError(ERROR_SUCCESS);
+    const bool adjusted = AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr);
+    const DWORD error = GetLastError();
+    CloseHandle(token);
+
+    return adjusted && error == ERROR_SUCCESS;
+}
+
+namespace
+{
+    using NtEnumerateSystemEnvironmentValuesExFn = NTSTATUS(NTAPI*)(ULONG, PVOID, PULONG);
+
+    enum SYSTEM_ENVIRONMENT_VALUE_INFORMATION_CLASS
+    {
+        SystemEnvironmentValueInformation = 1,
+    };
+
+    struct SYSTEM_ENVIRONMENT_VALUE
+    {
+        ULONG NextEntryOffset;
+        ULONG ValueOffset;
+        ULONG ValueLength;
+        ULONG Attributes;
+        WCHAR Name[1];
+    };
+}
+
+int main()
+{
+    if (!EnableSystemEnvironmentPrivilege())
+    {
+        std::wcerr << L"SeSystemEnvironmentPrivilege is unavailable or could not be enabled: "
+            << GetLastError() << std::endl;
+        return 1;
+    }
+
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll)
+    {
+        std::wcerr << L"Failed to load ntdll.dll" << std::endl;
+        return 1;
+    }
+
+    auto ntEnumerateSystemEnvironmentValuesEx =
+        reinterpret_cast<NtEnumerateSystemEnvironmentValuesExFn>(
+            GetProcAddress(ntdll, "NtEnumerateSystemEnvironmentValuesEx"));
+
+    if (!ntEnumerateSystemEnvironmentValuesEx)
+    {
+        std::wcerr << L"NtEnumerateSystemEnvironmentValuesEx was not found in ntdll.dll" << std::endl;
+        return 1;
+    }
+
+    ULONG bufferLength = 1;
+    std::vector<std::byte> buffer(bufferLength);
+    NTSTATUS status = ntEnumerateSystemEnvironmentValuesEx(
+        SystemEnvironmentValueInformation,
+        buffer.data(),
+        &bufferLength);
+
+    if (status != STATUS_BUFFER_TOO_SMALL && status != STATUS_INFO_LENGTH_MISMATCH)
+    {
+        std::wcerr << L"NtEnumerateSystemEnvironmentValuesEx initial call failed: 0x" << std::hex << static_cast<unsigned long>(status) << std::dec << std::endl;
+        return 1;
+    }
+
+    buffer.resize(bufferLength);
+    status = ntEnumerateSystemEnvironmentValuesEx(
+        SystemEnvironmentValueInformation,
+        buffer.data(),
+        &bufferLength);
+
+    if (!NT_SUCCESS(status))
+    {
+        std::wcerr << L"NtEnumerateSystemEnvironmentValuesEx final call failed: 0x" << std::hex << static_cast<unsigned long>(status) << std::dec << std::endl;
+        return 1;
+    }
+
+    auto* cursor = buffer.data();
+    auto* end = cursor + bufferLength;
+
+    while (cursor < end)
+    {
+        auto* entry = reinterpret_cast<SYSTEM_ENVIRONMENT_VALUE*>(cursor);
+        const auto remaining = static_cast<ULONG>(end - cursor);
+        if (remaining < sizeof(SYSTEM_ENVIRONMENT_VALUE) ||
+            entry->ValueOffset < sizeof(SYSTEM_ENVIRONMENT_VALUE) ||
+            entry->ValueOffset > remaining ||
+            entry->ValueLength > remaining - entry->ValueOffset)
+        {
+            std::wcerr << L"NtEnumerateSystemEnvironmentValuesEx returned an invalid record" << std::endl;
+            return 1;
+        }
+
+        const auto nameLength = (entry->ValueOffset - sizeof(SYSTEM_ENVIRONMENT_VALUE)) / sizeof(WCHAR);
+        auto* value = reinterpret_cast<const WCHAR*>(cursor + entry->ValueOffset);
+        const auto valueLength = entry->ValueLength / sizeof(WCHAR);
+
+        std::wstring line(entry->Name, nameLength);
+        line.append(L"=");
+        line.append(value, valueLength);
+        line.append(L"\n");
+        std::wcout << line;
+
+        if (entry->NextEntryOffset == 0)
+        {
+            break;
+        }
+
+        if (entry->NextEntryOffset > remaining)
+        {
+            std::wcerr << L"NtEnumerateSystemEnvironmentValuesEx returned an invalid entry offset" << std::endl;
+            return 1;
+        }
+
+        cursor += entry->NextEntryOffset;
+    }
+
+    std::wcout.flush();
+    
+    return 0;
+}
+
+// Run program: Ctrl + F5 or Debug > Start Without Debugging menu
+// Debug program: F5 or Debug > Start Debugging menu
+
+// Tips for Getting Started: 
+//   1. Use the Solution Explorer window to add/manage files
+//   2. Use the Team Explorer window to connect to source control
+//   3. Use the Output window to see build output and other messages
+//   4. In the future, to open this project again, go to File > Open > Project and select the .sln file
+
+// Run program: Ctrl + F5 or Debug > Start Without Debugging menu
+// Debug program: F5 or Debug > Start Debugging menu
+
+// Tips for Getting Started: 
+//   1. Use the Solution Explorer window to add/manage files
+//   2. Use the Team Explorer window to connect to source control
+//   3. Use the Output window to see build output and other messages
+//   4. Use the Error List window to view errors
+//   5. Go to Project > Add New Item to create new code files, or Project > Add Existing Item to add existing code files to the project
+//   6. In the future, to open this project again, go to File > Open > Project and select the .sln file
+
+// Already included in the project
+
+// End of file

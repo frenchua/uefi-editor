@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="winefivars/winefivars.vcxproj" Id="276c4153-f2a8-472c-ba98-238338ef2997" />
+</Solution>
