@@ -6,13 +6,17 @@
 //! [`load_option`], [`siglist`] and friends can re-encode edited values.
 
 pub mod attrs;
+pub mod capsule;
+pub mod cper;
 pub mod decode;
 pub mod devpath;
+pub mod form;
 pub mod guids;
 pub mod hex;
 pub mod key_option;
 pub mod load_option;
 pub mod siglist;
+pub mod spec;
 pub mod store;
 
 pub use uguid::{Guid, guid};

@@ -1,6 +1,9 @@
 //! `efivars-tui`: browse and edit UEFI variables in the terminal.
 
 mod app;
+mod form_editor;
+mod line_input;
+mod path_editor;
 mod ui;
 
 use std::path::PathBuf;

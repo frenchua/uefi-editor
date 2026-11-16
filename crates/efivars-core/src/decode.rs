@@ -1,10 +1,15 @@
-//! Registry mapping known variables to parsers, producing a display tree.
+//! Registry mapping the variables defined by the UEFI 2.11 specification to
+//! parsers, producing a display tree. Vendor-specific variables are not
+//! decoded.
 
-use crate::guids::{self, EFI_GLOBAL_VARIABLE, EFI_IMAGE_SECURITY_DATABASE};
+use crate::guids::{
+    self, EFI_CAPSULE_REPORT, EFI_DEVICE_SECURITY_DATABASE, EFI_GLOBAL_VARIABLE, EFI_HARDWARE_ERROR_VARIABLE,
+    EFI_IMAGE_SECURITY_DATABASE,
+};
 use crate::key_option::KeyOption;
 use crate::load_option::{self, LoadOption, is_numbered};
 use crate::siglist::SignatureDatabase;
-use crate::{Guid, Variable, devpath, hex};
+use crate::{Guid, Variable, capsule, cper, devpath, hex};
 
 /// A labelled value with optional children, rendered as an indented tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,6 +53,12 @@ pub enum Kind {
     KeyOption,
     SignatureDatabase,
     GuidList,
+    HwErrRecSupport,
+    /// Common Platform Error Record (`HwErrRec####`).
+    Cper,
+    CapsuleResult,
+    /// `CapsuleMax` / `CapsuleLast`: CHAR16[11] variable name.
+    CapsuleName,
 }
 
 impl Kind {
@@ -65,17 +76,36 @@ impl Kind {
             Kind::KeyOption => "EFI_KEY_OPTION",
             Kind::SignatureDatabase => "EFI_SIGNATURE_LIST[]",
             Kind::GuidList => "EFI_GUID[]",
+            Kind::HwErrRecSupport => "UINT16 error record support level",
+            Kind::Cper => "Common Platform Error Record",
+            Kind::CapsuleResult => "EFI_CAPSULE_RESULT_VARIABLE_HEADER",
+            Kind::CapsuleName => "CHAR16[11] capsule variable name",
         }
     }
 }
 
 /// Identify the structure of a variable from its vendor GUID and name.
+/// Only variables defined by the UEFI 2.11 specification are recognized.
 pub fn classify(vendor: &Guid, name: &str) -> Option<Kind> {
-    if *vendor == EFI_IMAGE_SECURITY_DATABASE {
-        return matches!(name, "db" | "dbx" | "dbt" | "dbr").then_some(Kind::SignatureDatabase);
+    // OS recovery options live in OS vendor namespaces (§3.4.1).
+    if is_numbered(name, "OsRecovery") {
+        return Some(Kind::LoadOption);
     }
-    if *vendor != EFI_GLOBAL_VARIABLE {
-        return None;
+    match *vendor {
+        EFI_IMAGE_SECURITY_DATABASE => {
+            return matches!(name, "db" | "dbx" | "dbt" | "dbr").then_some(Kind::SignatureDatabase);
+        }
+        EFI_DEVICE_SECURITY_DATABASE => return (name == "devdb").then_some(Kind::SignatureDatabase),
+        EFI_HARDWARE_ERROR_VARIABLE => return is_numbered(name, "HwErrRec").then_some(Kind::Cper),
+        EFI_CAPSULE_REPORT => {
+            return match name {
+                "CapsuleMax" | "CapsuleLast" => Some(Kind::CapsuleName),
+                _ if is_numbered(name, "Capsule") => Some(Kind::CapsuleResult),
+                _ => None,
+            };
+        }
+        EFI_GLOBAL_VARIABLE => {}
+        _ => return None,
     }
     Some(match name {
         _ if ["Boot", "Driver", "SysPrep", "PlatformRecovery"].iter().any(|p| is_numbered(name, p)) => {
@@ -85,18 +115,40 @@ pub fn classify(vendor: &Guid, name: &str) -> Option<Kind> {
         "BootOrder" | "DriverOrder" | "SysPrepOrder" => Kind::OptionOrder,
         "BootCurrent" | "BootNext" => Kind::OptionNumber,
         "Timeout" => Kind::Seconds,
-        "SecureBoot" | "SetupMode" | "AuditMode" | "DeployedMode" | "VendorKeys" => Kind::Bool,
-        "PlatformLang" | "PlatformLangCodes" | "Lang" | "LangCodes" => Kind::Ascii,
+        "SecureBoot" | "SetupMode" | "AuditMode" | "DeployedMode" | "VendorKeys" | "devAuthBoot" => Kind::Bool,
+        "PlatformLang" | "PlatformLangCodes" => Kind::Ascii,
         "ConIn" | "ConOut" | "ErrOut" | "ConInDev" | "ConOutDev" | "ErrOutDev" => Kind::DevicePath,
         "OsIndications" | "OsIndicationsSupported" => Kind::OsIndications,
         "BootOptionSupport" => Kind::BootOptionSupport,
-        "PK" | "KEK" | "PKDefault" | "KEKDefault" | "dbDefault" | "dbxDefault" | "dbtDefault" | "dbrDefault" => {
-            Kind::SignatureDatabase
-        }
-        "SignatureSupport" => Kind::GuidList,
+        "HwErrRecSupport" => Kind::HwErrRecSupport,
+        "PK" | "KEK" | "PKDefault" | "KEKDefault" | "dbDefault" | "dbxDefault" | "dbtDefault" | "dbrDefault"
+        | "devdbDefault" => Kind::SignatureDatabase,
+        "SignatureSupport" | "OsRecoveryOrder" => Kind::GuidList,
         _ => return None,
     })
 }
+
+/// Load-option variable prefix referenced by an order list or option number
+/// (`DriverOrder` lists `Driver####` entries, and so on).
+pub fn option_prefix(name: &str) -> &'static str {
+    match name {
+        "DriverOrder" => "Driver",
+        "SysPrepOrder" => "SysPrep",
+        _ => "Boot",
+    }
+}
+
+/// `EFI_OS_INDICATIONS_*` bits (§8.5.4).
+pub const OS_INDICATIONS: &[(u64, &str)] = &[
+    (0x01, "BOOT_TO_FW_UI"),
+    (0x02, "TIMESTAMP_REVOCATION"),
+    (0x04, "FILE_CAPSULE_DELIVERY_SUPPORTED"),
+    (0x08, "FMP_CAPSULE_SUPPORTED"),
+    (0x10, "CAPSULE_RESULT_VAR_SUPPORTED"),
+    (0x20, "START_OS_RECOVERY"),
+    (0x40, "START_PLATFORM_RECOVERY"),
+    (0x80, "JSON_CONFIG_DATA_REFRESH"),
+];
 
 /// Decoded view of a variable.
 pub struct Decoded {
@@ -108,18 +160,32 @@ pub struct Decoded {
 /// its bytes failed to parse.
 pub fn decode(var: &Variable) -> Option<Result<Decoded, String>> {
     let kind = classify(&var.key.vendor, &var.key.name)?;
-    Some(decode_as(kind, &var.data).map(|fields| Decoded { kind, fields }))
+    Some(decode_as(kind, &var.key.name, &var.data).map(|fields| Decoded { kind, fields }))
 }
 
-fn decode_as(kind: Kind, data: &[u8]) -> Result<Vec<Field>, String> {
+fn decode_as(kind: Kind, name: &str, data: &[u8]) -> Result<Vec<Field>, String> {
+    let prefix = option_prefix(name);
     Ok(match kind {
         Kind::LoadOption => load_option_fields(&LoadOption::parse(data).map_err(|e| e.to_string())?),
         Kind::OptionOrder => load_option::parse_order(data)?
             .iter()
             .enumerate()
-            .map(|(i, n)| Field::new(format!("[{i}]"), format!("Boot{n:04X}")))
+            .map(|(i, n)| Field::new(format!("[{i}]"), format!("{prefix}{n:04X}")))
             .collect(),
-        Kind::OptionNumber => vec![Field::new("Option", format!("Boot{:04X}", u16::from_le_bytes(fixed::<2>(data)?)))],
+        Kind::OptionNumber => {
+            vec![Field::new("Option", format!("{prefix}{:04X}", u16::from_le_bytes(fixed::<2>(data)?)))]
+        }
+        Kind::HwErrRecSupport => {
+            let v = u16::from_le_bytes(fixed::<2>(data)?);
+            vec![Field::new("Level", match v {
+                0 => "0 (no support)".to_string(),
+                1 => "1 (supported, UEFI §8.2.7)".to_string(),
+                n => format!("{n} (reserved)"),
+            })]
+        }
+        Kind::Cper => cper::fields(data)?,
+        Kind::CapsuleResult => capsule::result_fields(data)?,
+        Kind::CapsuleName => capsule::name_fields(data)?,
         Kind::Seconds => {
             let secs = u16::from_le_bytes(fixed::<2>(data)?);
             let text = match secs {
@@ -144,13 +210,8 @@ fn decode_as(kind: Kind, data: &[u8]) -> Result<Vec<Field>, String> {
         Kind::DevicePath => device_path_fields(data)?,
         Kind::OsIndications => {
             let v = u64::from_le_bytes(fixed::<8>(data)?);
-            let names = [
-                "BOOT_TO_FW_UI", "TIMESTAMP_REVOCATION", "FILE_CAPSULE_DELIVERY_SUPPORTED",
-                "FMP_CAPSULE_SUPPORTED", "CAPSULE_RESULT_VAR_SUPPORTED", "START_OS_RECOVERY",
-                "START_PLATFORM_RECOVERY", "JSON_CONFIG_DATA_REFRESH",
-            ];
             let mut fields = vec![Field::new("Value", format!("0x{v:016x}"))];
-            fields.extend(names.iter().enumerate().filter(|(i, _)| v & (1 << i) != 0).map(|(_, n)| Field::new("set", *n)));
+            fields.extend(OS_INDICATIONS.iter().filter(|(bit, _)| v & bit != 0).map(|(_, n)| Field::new("set", *n)));
             fields
         }
         Kind::BootOptionSupport => {
@@ -170,10 +231,7 @@ fn decode_as(kind: Kind, data: &[u8]) -> Result<Vec<Field>, String> {
                 Field::new("Option CRC32", format!("0x{:08x}", k.boot_option_crc)),
                 Field::new("Modifiers", k.modifiers()),
             ];
-            fields.extend(k.keys.iter().enumerate().map(|(i, key)| {
-                let ch = char::from_u32(key.unicode_char as u32).filter(|c| !c.is_control());
-                Field::new(format!("Key[{i}]"), format!("scan 0x{:04x}, char {:?}", key.scan_code, ch))
-            }));
+            fields.extend(k.keys.iter().enumerate().map(|(i, key)| Field::new(format!("Key[{i}]"), key.to_text())));
             fields
         }
         Kind::SignatureDatabase => signature_fields(&SignatureDatabase::parse(data).map_err(|e| e.to_string())?),
@@ -182,9 +240,14 @@ fn decode_as(kind: Kind, data: &[u8]) -> Result<Vec<Field>, String> {
                 return Err(format!("length {} is not a multiple of 16", data.len()));
             }
             data.chunks_exact(16)
-                .map(|c| {
+                .enumerate()
+                .map(|(i, c)| {
                     let g = Guid::from_bytes(c.try_into().unwrap());
-                    Field::new(guids::cert_type_name(&g).unwrap_or("?"), g.to_string())
+                    let label = guids::cert_type_name(&g).or(guids::vendor_name(&g));
+                    Field::new(format!("[{i}]"), match label {
+                        Some(l) => format!("{g} ({l})"),
+                        None => g.to_string(),
+                    })
                 })
                 .collect()
         }
@@ -200,9 +263,20 @@ pub fn load_option_fields(opt: &LoadOption) -> Vec<Field> {
         Field::new("Attributes", format!("0x{:08x} {}", opt.attributes, opt.attribute_names())),
         Field::new("Description", opt.description.to_string()),
     ];
-    match device_path_fields(&opt.file_path_list) {
-        Ok(children) => fields.push(Field::new("Device path", opt.device_path_text()).with(children)),
-        Err(e) => fields.push(Field::new("Device path", e)),
+    // FilePathList is a packed array of device paths; the first locates the
+    // image and any others are OS-specific (§3.1.3).
+    match devpath::DevicePath::parse_list(&opt.file_path_list) {
+        Ok(paths) => {
+            for (i, path) in paths.iter().enumerate() {
+                let label = if i == 0 { "Device path".to_string() } else { format!("Device path {i}") };
+                let children = device_path_fields(&path.to_bytes().unwrap_or_default()).unwrap_or_default();
+                fields.push(Field::new(label, path.to_text()).with(children));
+            }
+        }
+        Err(_) => match device_path_fields(&opt.file_path_list) {
+            Ok(children) => fields.push(Field::new("Device path", opt.device_path_text()).with(children)),
+            Err(e) => fields.push(Field::new("Device path", e)),
+        },
     }
     if !opt.optional_data.is_empty() {
         let ascii: String = opt.optional_data.iter().take(48).map(|&b| hex::printable(b)).collect();
@@ -294,6 +368,19 @@ mod tests {
         assert_eq!(classify(&EFI_IMAGE_SECURITY_DATABASE, "dbx"), Some(Kind::SignatureDatabase));
         assert_eq!(classify(&EFI_IMAGE_SECURITY_DATABASE, "BootOrder"), None);
         assert_eq!(classify(&guids::MICROSOFT_VENDOR, "Boot0000"), None);
+        assert_eq!(classify(&guids::MICROSOFT_VENDOR, "OsRecovery0001"), Some(Kind::LoadOption));
+        assert_eq!(classify(&EFI_HARDWARE_ERROR_VARIABLE, "HwErrRec0001"), Some(Kind::Cper));
+        assert_eq!(classify(&EFI_CAPSULE_REPORT, "Capsule0002"), Some(Kind::CapsuleResult));
+        assert_eq!(classify(&EFI_CAPSULE_REPORT, "CapsuleLast"), Some(Kind::CapsuleName));
+        assert_eq!(classify(&EFI_DEVICE_SECURITY_DATABASE, "devdb"), Some(Kind::SignatureDatabase));
+        // Lang/LangCodes were removed from the UEFI 2.11 global variable table.
+        assert_eq!(classify(&EFI_GLOBAL_VARIABLE, "Lang"), None);
+    }
+
+    #[test]
+    fn order_lists_use_their_own_prefix() {
+        let d = decode(&var("DriverOrder", EFI_GLOBAL_VARIABLE, &[1, 0])).unwrap().unwrap();
+        assert_eq!(d.fields[0].value, "Driver0001");
     }
 
     #[test]

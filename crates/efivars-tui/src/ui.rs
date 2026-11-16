@@ -8,7 +8,12 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 
-use crate::app::{App, HexEditor, Mode, OrderEditor, View};
+use efivars_core::form::{self, Value};
+
+use crate::app::{App, HexEditor, Mode, View};
+use crate::form_editor::{FormEditor, Row};
+use crate::line_input::LineInput;
+use crate::path_editor::{Entry, PathEditor, SYNTAX_HELP, Target};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [main, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
@@ -63,9 +68,13 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             lines.extend(hex_edit_lines(&var.data, ed));
             "hex edit"
         }
-        (Mode::OrderEdit(ed), _) => {
-            lines.extend(order_edit_lines(app, ed));
-            "reorder"
+        (Mode::FormEdit(ed), _) => {
+            lines.extend(form_edit_lines(app, ed));
+            "edit"
+        }
+        (Mode::PathEdit(ed), _) => {
+            lines.extend(path_edit_lines(ed));
+            "device path edit"
         }
         (_, View::Hex) => {
             lines.extend(hex::dump_lines(&var.data).into_iter().map(Line::from));
@@ -154,29 +163,160 @@ fn hex_edit_lines(original: &[u8], ed: &HexEditor) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn order_edit_lines(app: &App, ed: &OrderEditor) -> Vec<Line<'static>> {
-    ed.order
-        .iter()
-        .enumerate()
-        .map(|(i, n)| {
-            let name = format!("Boot{n:04X}");
-            let desc = app
-                .vars
-                .iter()
-                .find(|v| v.key.vendor == guids::EFI_GLOBAL_VARIABLE && v.key.name == name)
-                .and_then(|v| efivars_core::load_option::LoadOption::parse(&v.data).ok())
-                .map(|o| o.description.to_string())
-                .unwrap_or_else(|| "(missing)".into());
-            let line = Line::from(format!("{i:>2}. {name}  {desc}"));
-            if i == ed.selected { line.reversed() } else { line }
-        })
-        .collect()
+fn input_line(prefix: String, input: &LineInput) -> Line<'static> {
+    let mut spans = vec![Span::styled(prefix, Style::new().fg(Color::Yellow).bold())];
+    spans.extend(input.spans());
+    Line::from(spans)
+}
+
+/// Description of the load option a reference points to, for display.
+fn option_note(app: &App, value: &Value) -> String {
+    match value {
+        Value::OptionRef { number, prefix } => match form::option_description(&app.vars, prefix, *number) {
+            Some(d) => format!("  \"{d}\""),
+            None => "  (no such option)".into(),
+        },
+        _ => String::new(),
+    }
+}
+
+fn form_edit_lines(app: &App, ed: &FormEditor) -> Vec<Line<'static>> {
+    if let Some((sub, row)) = &ed.sub {
+        let (Row::Field(i) | Row::Flag(i, _) | Row::Item(i, _) | Row::Add(i)) = *row;
+        let what = match row {
+            Row::Item(_, j) => format!("{} [{j}]", ed.fields[i].label),
+            Row::Add(_) => format!("new entry in {}", ed.fields[i].label),
+            _ => ed.fields[i].label.clone(),
+        };
+        let mut lines = vec![Line::styled(format!("Editing {what} (s returns to the form)"), Style::new().bold()), Line::default()];
+        lines.extend(path_edit_lines(sub));
+        return lines;
+    }
+    let dim = Style::new().fg(Color::DarkGray);
+    let selected = ed.selected_row();
+    let mut lines = Vec::new();
+    for row in ed.rows() {
+        if let Some((input, _)) = ed.input.as_ref().filter(|(_, r)| *r == row) {
+            let label = match row {
+                Row::Item(i, j) => format!("  {} [{j}] › ", ed.fields[i].label),
+                Row::Add(i) => format!("  {} + › ", ed.fields[i].label),
+                Row::Field(i) | Row::Flag(i, _) => format!("{} › ", ed.fields[i].label),
+            };
+            lines.push(input_line(label, input));
+            continue;
+        }
+        let line = match row {
+            Row::Field(i) => {
+                let f = &ed.fields[i];
+                let mut spans = vec![Span::styled(format!("{:<20}", f.label), Style::new().bold())];
+                match &f.value {
+                    Value::List { .. } => {}
+                    v => {
+                        spans.push(Span::raw(v.display()));
+                        spans.push(Span::styled(option_note(app, v), dim));
+                    }
+                }
+                if !f.editable {
+                    spans.push(Span::styled("  (computed)", dim));
+                }
+                Line::from(spans)
+            }
+            Row::Flag(i, j) => {
+                let Value::Flags { value, defs } = &ed.fields[i].value else { continue };
+                let d = &defs[j];
+                let mark = if value & d.mask != 0 { "[x]" } else { "[ ]" };
+                let note = if d.note.is_empty() { String::new() } else { format!("  ({})", d.note) };
+                Line::from(vec![Span::raw(format!("    {mark} {}", d.name)), Span::styled(note, dim)])
+            }
+            Row::Item(i, j) => {
+                let Value::List { items, .. } = &ed.fields[i].value else { continue };
+                Line::from(vec![
+                    Span::raw(format!("    [{j}] {}", items[j].display())),
+                    Span::styled(option_note(app, &items[j]), dim),
+                ])
+            }
+            Row::Add(_) => Line::styled("    + add…", dim),
+        };
+        lines.push(if row == selected && ed.input.is_none() { line.reversed() } else { line });
+    }
+    lines.push(Line::default());
+    if let Some(e) = &ed.error {
+        lines.push(Line::styled(format!("✗ {e}"), Style::new().fg(Color::Red)));
+    }
+    let help = &ed.selected_field().help;
+    if !help.is_empty() {
+        lines.push(Line::styled(help.clone(), dim));
+    }
+    lines
+}
+
+fn path_edit_lines(ed: &PathEditor) -> Vec<Line<'static>> {
+    let dim = Style::new().fg(Color::DarkGray);
+    let mut lines = vec![match ed.to_path() {
+        Ok(path) => Line::from(vec![Span::styled("Result  ", Style::new().fg(Color::Cyan)), Span::raw(path.to_text())]),
+        Err(e) => Line::from(vec![Span::styled("Result  ", Style::new().fg(Color::Cyan)), Span::styled(e, Style::new().fg(Color::Red))]),
+    }];
+    lines.push(Line::default());
+
+    let input_at = |target: Target| ed.input.as_ref().filter(|(_, t)| *t == target).map(|(inp, _)| inp);
+    let input_row = |input: &LineInput| input_line("› edit ".into(), input);
+
+    let mut instance = 0;
+    for (i, entry) in ed.entries.iter().enumerate() {
+        if let Some(input) = input_at(Target::Insert(i)) {
+            lines.push(input_row(input));
+        }
+        if let Some(input) = input_at(Target::Replace(i)) {
+            lines.push(input_row(input));
+            continue;
+        }
+        let selected = i == ed.selected && ed.input.is_none();
+        let marker = if selected { "› " } else { "  " };
+        let line = match entry {
+            Entry::Node(node) => Line::from(vec![
+                Span::raw(marker),
+                Span::styled(format!("{:<13}", format!("{}/{}", node.type_name(), node.sub_type)), dim),
+                Span::raw(node.to_text()),
+            ]),
+            Entry::Separator => {
+                instance += 1;
+                Line::from(vec![Span::raw(marker), Span::styled(format!("──── instance {instance} ────"), dim)])
+            }
+        };
+        lines.push(if selected { line.reversed() } else { line });
+    }
+    if let Some(input) = input_at(Target::Insert(ed.entries.len())) {
+        lines.push(input_row(input));
+    }
+    if ed.entries.is_empty() && ed.input.is_none() {
+        lines.push(Line::styled("  (no nodes; press a to add one)", dim));
+    }
+
+    lines.push(Line::default());
+    if let Some(e) = &ed.error {
+        lines.push(Line::styled(format!("✗ {e}"), Style::new().fg(Color::Red)));
+        lines.push(Line::default());
+    }
+    lines.push(Line::styled("Node syntax (UEFI spec §10.6; numbers are decimal or 0x hex):", dim));
+    lines.extend(SYNTAX_HELP.iter().map(|s| Line::styled(format!("  {s}"), dim)));
+    lines
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let keys = match app.mode {
+    let keys = match &app.mode {
         Mode::Normal => "q quit · / filter · Tab hex · e edit · x hex-edit · a toggle active · D dump · r reload │ ",
         Mode::Filter => "type to filter · Enter keep · Esc clear │ ",
+        Mode::PathEdit(ed) if ed.input.is_some() => "type node text · ←→ Home End move · Enter apply · Esc discard │ ",
+        Mode::FormEdit(FormEditor { sub: Some((ed, _)), .. }) if ed.input.is_some() => {
+            "type node text · ←→ Home End move · Enter apply · Esc discard │ "
+        }
+        Mode::PathEdit(_) | Mode::FormEdit(FormEditor { sub: Some(_), .. }) => {
+            "↑↓ select · Enter edit · a add node · i add instance · d delete · K/J move · s save · Esc cancel │ "
+        }
+        Mode::FormEdit(ed) if ed.input.is_some() => "type a value · ←→ Home End move · Enter apply · Esc discard │ ",
+        Mode::FormEdit(_) => {
+            "↑↓ select · Enter/Space edit or toggle · ←→ choose · d delete · K/J move · t text/hex · s save · Esc cancel │ "
+        }
         _ => "",
     };
     let line = Line::from(vec![Span::styled(keys, Style::new().fg(Color::DarkGray)), Span::raw(app.status.clone())]);
